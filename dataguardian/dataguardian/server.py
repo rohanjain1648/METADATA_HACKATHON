@@ -1,0 +1,168 @@
+"""
+DataGuardian MCP Server
+AI-powered Compliance & Breach Impact Agent for OpenMetadata
+
+Run with:
+    fastmcp run dataguardian/server.py
+Or install and run:
+    dataguardian
+"""
+
+import os
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+
+load_dotenv()
+
+# Initialize OpenMetadata client before importing tools
+from dataguardian import om_client
+om_client.init()
+
+from dataguardian.tools.search_sensitive import search_sensitive_assets
+from dataguardian.tools.breach_impact import get_breach_impact_graph
+from dataguardian.tools.auto_classify import auto_classify_table
+from dataguardian.tools.compliance_report import generate_compliance_report
+from dataguardian.tools.orphan_finder import find_orphaned_sensitive_assets
+from dataguardian.tools.access_chain import get_data_access_chain
+
+mcp = FastMCP(
+    name="DataGuardian",
+    instructions="""
+You are DataGuardian, an AI compliance and data governance agent powered by OpenMetadata.
+
+You help data teams answer critical questions about sensitive data:
+- Which assets contain PII, PHI, or other sensitive data?
+- If a table is breached, what is the downstream blast radius?
+- Who owns sensitive assets and who needs to be notified?
+- Which sensitive assets have no owner, no tests, no lineage (highest risk)?
+- Generate compliance reports for GDPR, HIPAA, CCPA, SOC2.
+- Auto-classify tables for PII and write tags back to OpenMetadata.
+
+Always be specific, cite asset FQNs, and prioritize actionable recommendations.
+""",
+)
+
+
+@mcp.tool()
+async def search_sensitive(
+    tag: str = "PII",
+    entity_type: str = "all",
+    limit: int = 50,
+) -> dict:
+    """
+    Search OpenMetadata for data assets tagged with a sensitivity label.
+
+    Use this to find all tables, dashboards, pipelines, or topics that contain
+    PII, GDPR, HIPAA, PHI, Confidential, or other sensitive data.
+
+    Args:
+        tag: Sensitivity tag to search for. Common values: PII, GDPR, HIPAA, PHI, Sensitive, Confidential.
+        entity_type: Filter by type: table, dashboard, pipeline, topic, mlmodel, or 'all'.
+        limit: Maximum number of results (default 50).
+    """
+    return await search_sensitive_assets(tag=tag, entity_type=entity_type, limit=limit)
+
+
+@mcp.tool()
+async def breach_impact(
+    fqn: str,
+    direction: str = "downstream",
+    depth: int = 5,
+) -> dict:
+    """
+    Given a table or asset FQN, traverse the lineage graph to find everything affected.
+
+    Use this when a data asset may be compromised — it returns the full blast radius:
+    every downstream table, dashboard, pipeline, ML model, and their owners.
+
+    Args:
+        fqn: Fully qualified name of the asset (e.g. mysql_prod.analytics.public.users).
+        direction: 'downstream' to see what's affected, 'upstream' to see data sources.
+        depth: How many lineage hops to traverse (default 5).
+    """
+    return await get_breach_impact_graph(fqn=fqn, direction=direction, depth=depth)
+
+
+@mcp.tool()
+async def classify_table(
+    table_fqn: str,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Auto-classify a table's columns for PII and sensitive data using AI, then tag in OpenMetadata.
+
+    This is the closed-loop governance tool: it reads the schema, uses an LLM to detect
+    sensitive columns (email, SSN, phone, DOB, etc.), and writes tags back to OpenMetadata.
+
+    Args:
+        table_fqn: Fully qualified name of the table to classify.
+        dry_run: If True, shows what would be tagged without writing to OpenMetadata.
+    """
+    return await auto_classify_table(table_fqn=table_fqn, dry_run=dry_run)
+
+
+@mcp.tool()
+async def compliance_report(
+    regulation: str = "GDPR",
+    domain: str | None = None,
+    output_format: str = "markdown",
+) -> dict:
+    """
+    Generate a compliance inventory report for GDPR, HIPAA, CCPA, or SOC2.
+
+    Aggregates all sensitive assets from OpenMetadata, identifies owners,
+    flags ungoverned assets, and produces a structured compliance document.
+
+    Args:
+        regulation: GDPR | HIPAA | CCPA | SOC2
+        domain: Optional OpenMetadata domain name to scope the report.
+        output_format: 'markdown' for human-readable, 'json' for structured data.
+    """
+    return await generate_compliance_report(
+        regulation=regulation,
+        domain=domain,
+        output_format=output_format,
+    )
+
+
+@mcp.tool()
+async def orphaned_sensitive_assets(
+    check_quality: bool = True,
+    check_lineage: bool = True,
+) -> dict:
+    """
+    Find sensitive/PII assets with no owner, no data quality tests, or no lineage.
+
+    These are the highest-risk assets in your organization — sensitive data that
+    nobody is responsible for and nobody is monitoring.
+
+    Args:
+        check_quality: Also flag assets with no data quality test suites.
+        check_lineage: Also flag assets with no lineage connections.
+    """
+    return await find_orphaned_sensitive_assets(
+        check_quality=check_quality,
+        check_lineage=check_lineage,
+    )
+
+
+@mcp.tool()
+async def data_access_chain(table_fqn: str) -> dict:
+    """
+    Get the complete access chain for a sensitive table.
+
+    Returns direct owners, team memberships, followers, downstream asset owners,
+    and a ready-to-use notification list for incident response.
+
+    Args:
+        table_fqn: Fully qualified name of the table.
+    """
+    return await get_data_access_chain(table_fqn=table_fqn)
+
+
+def main():
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -8,6 +8,8 @@ Or install and run:
     dataguardian
 """
 
+import atexit
+import asyncio
 import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -24,6 +26,26 @@ from dataguardian.tools.auto_classify import auto_classify_table
 from dataguardian.tools.compliance_report import generate_compliance_report
 from dataguardian.tools.orphan_finder import find_orphaned_sensitive_assets
 from dataguardian.tools.access_chain import get_data_access_chain
+from dataguardian.tools.bulk_classify import bulk_classify_tables
+from dataguardian.tools.retention_checker import check_retention_policies
+from dataguardian.tools.linkage_detector import detect_pii_linkage
+from dataguardian.tools.drift_monitor import monitor_tag_drift
+from dataguardian.tools.playbook_generator import generate_incident_playbook
+
+
+def _shutdown():
+    """Drain the shared HTTP connection pool on process exit."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(om_client.close())
+        else:
+            loop.run_until_complete(om_client.close())
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown)
 
 mcp = FastMCP(
     name="DataGuardian",
@@ -37,6 +59,11 @@ You help data teams answer critical questions about sensitive data:
 - Which sensitive assets have no owner, no tests, no lineage (highest risk)?
 - Generate compliance reports for GDPR, HIPAA, CCPA, SOC2.
 - Auto-classify tables for PII and write tags back to OpenMetadata.
+- Bulk-classify all unclassified sensitive tables in one shot.
+- Check which sensitive assets are missing retention/expiry policies.
+- Detect pairs of tables that could re-identify individuals when joined.
+- Monitor tag drift — detect when sensitive column tags have been removed.
+- Generate a full incident response playbook for a breached asset.
 
 Always be specific, cite asset FQNs, and prioritize actionable recommendations.
 """,
@@ -158,6 +185,103 @@ async def data_access_chain(table_fqn: str) -> dict:
         table_fqn: Fully qualified name of the table.
     """
     return await get_data_access_chain(table_fqn=table_fqn)
+
+
+@mcp.tool()
+async def bulk_classify(
+    dry_run: bool = False,
+    limit: int = 100,
+) -> dict:
+    """
+    Auto-classify all sensitive tables that have no existing PII/PHI column tags.
+
+    Searches for sensitive assets, filters to unclassified tables, then runs
+    classify_table on each one. Use this to bootstrap PII tagging for a new
+    OpenMetadata instance without invoking classify_table individually.
+
+    Args:
+        dry_run: If True, shows what would be tagged without writing to OpenMetadata.
+        limit: Maximum number of unclassified tables to process (default 100).
+    """
+    return await bulk_classify_tables(dry_run=dry_run, limit=limit)
+
+
+@mcp.tool()
+async def retention_checker(
+    regulation: str = "GDPR",
+    domain: str | None = None,
+) -> dict:
+    """
+    Find sensitive assets that have no retention policy or expiry metadata.
+
+    Checks each asset's description and custom properties for retention-related
+    keywords. Non-compliant assets are flagged with a recommended remediation action.
+
+    Args:
+        regulation: GDPR | HIPAA | CCPA | SOC2 (default GDPR).
+        domain: Optional OpenMetadata domain name to scope the scan.
+    """
+    return await check_retention_policies(regulation=regulation, domain=domain)
+
+
+@mcp.tool()
+async def linkage_detector(
+    domain: str | None = None,
+    min_shared_columns: int = 2,
+) -> dict:
+    """
+    Detect pairs of tables that could re-identify individuals when joined.
+
+    Identifies tables sharing two or more PII column name patterns (email, ssn,
+    user_id, etc.). HIGH risk = 3+ shared columns, MEDIUM = 2 shared columns.
+
+    Args:
+        domain: Optional OpenMetadata domain name to scope the analysis.
+        min_shared_columns: Minimum shared PII columns to flag a pair (default 2).
+    """
+    return await detect_pii_linkage(domain=domain, min_shared_columns=min_shared_columns)
+
+
+@mcp.tool()
+async def drift_monitor(
+    table_fqn: str,
+    snapshot_path: str,
+) -> dict:
+    """
+    Monitor a table for sensitive tag drift — detect removed or added column tags.
+
+    On first run, creates a baseline snapshot. On subsequent runs, compares current
+    tags against the snapshot and reports any columns that lost sensitive tags.
+
+    Args:
+        table_fqn: Fully qualified name of the table to monitor.
+        snapshot_path: File path to save/load the tag snapshot (JSON).
+    """
+    return await monitor_tag_drift(table_fqn=table_fqn, snapshot_path=snapshot_path)
+
+
+@mcp.tool()
+async def incident_playbook(
+    table_fqn: str,
+    regulation: str = "GDPR",
+    incident_description: str | None = None,
+) -> dict:
+    """
+    Generate a complete incident response playbook for a breached data asset.
+
+    Combines breach impact analysis, access chain resolution, and regulation-specific
+    obligations to produce a ready-to-send notification draft.
+
+    Args:
+        table_fqn: Fully qualified name of the breached asset.
+        regulation: GDPR | HIPAA | CCPA | SOC2 (default GDPR).
+        incident_description: Optional context about the incident for the LLM.
+    """
+    return await generate_incident_playbook(
+        table_fqn=table_fqn,
+        regulation=regulation,
+        incident_description=incident_description,
+    )
 
 
 def main():

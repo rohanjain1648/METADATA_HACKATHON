@@ -8,13 +8,11 @@ import json
 from dataguardian import om_client
 from dataguardian.llm_client import get_client, get_model
 from dataguardian.tools.search_sensitive import search_sensitive_assets
+from dataguardian.config import load_regulation_tags
 
-REGULATION_TAGS = {
-    "GDPR": ["PII", "GDPR", "Sensitive"],
-    "HIPAA": ["PHI", "HIPAA", "HealthData"],
-    "CCPA": ["PII", "CCPA", "Sensitive"],
-    "SOC2": ["Sensitive", "Confidential"],
-}
+REGULATION_TAGS = load_regulation_tags()
+
+LLM_ASSET_CAP = 50
 
 REPORT_PROMPT = """You are a compliance officer. Based on the following data asset inventory, 
 generate a formal {regulation} compliance report.
@@ -82,6 +80,9 @@ async def generate_compliance_report(
     orphaned = [a for a in unique_assets if not a.get("owner")]
 
     # 4. Generate narrative report via LLM
+    total_unique = len(unique_assets)
+    assets_for_llm = unique_assets[:LLM_ASSET_CAP]
+
     client = get_client()
     response = await client.chat.completions.create(
         model=get_model(),
@@ -89,7 +90,7 @@ async def generate_compliance_report(
             "role": "user",
             "content": REPORT_PROMPT.format(
                 regulation=regulation,
-                assets_json=json.dumps(unique_assets[:50], indent=2),  # cap for token limit
+                assets_json=json.dumps(assets_for_llm, indent=2),  # cap for token limit
             ),
         }],
         temperature=0.2,
@@ -105,6 +106,8 @@ async def generate_compliance_report(
         "orphaned_assets": [a["fqn"] for a in orphaned],
         "asset_inventory": unique_assets,
         "report": report_text,
+        "truncated": len(assets_for_llm) < total_unique,
+        "truncated_at": LLM_ASSET_CAP if len(assets_for_llm) < total_unique else None,
     }
 
     if output_format == "json":

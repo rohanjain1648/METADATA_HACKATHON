@@ -8,24 +8,9 @@ This is the closed-loop governance feature — discovery to tagging in one shot.
 import json
 from dataguardian import om_client
 from dataguardian.llm_client import get_client, get_model
+from dataguardian.config import load_tag_map
 
-# Mapping of LLM-detected categories to OpenMetadata tag FQNs
-# Adjust these to match your OpenMetadata classification setup
-TAG_MAP = {
-    "email": "PII.Email",
-    "phone": "PII.Phone",
-    "ssn": "PII.SSN",
-    "name": "PII.Name",
-    "address": "PII.Address",
-    "date_of_birth": "PII.DateOfBirth",
-    "credit_card": "PII.CreditCard",
-    "ip_address": "PII.IPAddress",
-    "location": "PII.Location",
-    "health": "PHI.HealthData",
-    "financial": "Sensitive.Financial",
-    "password": "Sensitive.Credential",
-    "token": "Sensitive.Credential",
-}
+TAG_MAP = load_tag_map()
 
 CLASSIFICATION_PROMPT = """You are a data privacy expert. Analyze the following table columns and identify which ones contain sensitive or PII data.
 

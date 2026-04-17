@@ -23,6 +23,7 @@ Search, Lineage, Tags, Governance, Teams, and Data Quality APIs.
 11. [Known Limitations](#11-known-limitations)
 12. [What I'd Improve With More Time](#12-what-id-improve-with-more-time)
 
+
 ---
 
 ## 1. Problem Statement
@@ -49,6 +50,11 @@ DataGuardian answers all three in seconds, not days.
 | `compliance_report` | Generate a GDPR Article 30 / HIPAA / CCPA / SOC2 inventory |
 | `orphaned_sensitive_assets` | Which sensitive assets have no owner, no tests, or no lineage? |
 | `data_access_chain` | Who has access to this table and all downstream assets? |
+| `bulk_classify` | Classify all unclassified sensitive tables in one shot |
+| `retention_checker` | Find sensitive assets missing retention/expiry policies |
+| `linkage_detector` | Detect table pairs that could re-identify individuals when joined |
+| `drift_monitor` | Detect when sensitive column tags have been removed |
+| `incident_playbook` | Generate a full incident response playbook for a breached asset |
 
 ### Example Queries (natural language via any MCP client)
 
@@ -59,13 +65,18 @@ DataGuardian answers all three in seconds, not days.
 "Generate a GDPR compliance report for our analytics domain"
 "Show me all sensitive assets with no owner — our highest risk data"
 "Who do I need to notify if the customers table is compromised?"
+"Classify all unclassified sensitive tables in our catalog"
+"Which sensitive assets are missing a retention policy under GDPR?"
+"Are there any table pairs that could re-identify users when joined?"
+"Has the users table lost any PII column tags since last week?"
+"Generate a GDPR incident playbook for the payments.transactions table"
 ```
 
 ---
 
 ## 3. System Overview
 
-DataGuardian sits between your MCP client (Claude Desktop, Kiro, Cursor) and your OpenMetadata instance. It exposes six tools that each map to a specific governance workflow:
+DataGuardian sits between your MCP client (Claude Desktop, Kiro, Cursor) and your OpenMetadata instance. It exposes eleven tools that each map to a specific governance workflow:
 
 ```mermaid
 flowchart TD
@@ -73,7 +84,7 @@ flowchart TD
     MC["MCP Client\nClaude / Kiro / Cursor"]
     DG["🛡️ DataGuardian\nMCP Server"]
     OM["OpenMetadata\nREST API"]
-    LLM["🤖 OpenAI\nLLM API"]
+    LLM["🤖 Gemini\nLLM API"]
 
     U -->|natural language query| MC
     MC -->|tool calls via MCP protocol| DG
@@ -86,6 +97,13 @@ flowchart TD
     DG -->|classify_table| LLM
     DG -->|compliance_report| OM
     DG -->|compliance_report| LLM
+    DG -->|bulk_classify| OM
+    DG -->|bulk_classify| LLM
+    DG -->|retention_checker| OM
+    DG -->|linkage_detector| OM
+    DG -->|drift_monitor| OM
+    DG -->|incident_playbook| OM
+    DG -->|incident_playbook| LLM
 
     OM --> SearchAPI["Search API\nasset discovery"]
     OM --> LineageAPI["Lineage API\ngraph traversal"]
@@ -94,7 +112,7 @@ flowchart TD
     OM --> QualityAPI["Data Quality API\ntest coverage"]
 ```
 
-The LLM (OpenAI) is only invoked for two tools: `classify_table` (column-level PII detection) and `compliance_report` (narrative generation). All other tools are pure API orchestration.
+The LLM (Gemini) is only invoked for tools that require natural language generation: `classify_table` (column-level PII detection), `compliance_report` (narrative generation), `bulk_classify` (delegates to `classify_table`), and `incident_playbook` (notification draft). All other tools are pure API orchestration.
 
 ---
 
@@ -108,41 +126,49 @@ graph LR
 
     subgraph Server["DataGuardian MCP Server (FastMCP)"]
         SRV["server.py\ntool registration + system prompt"]
-        OMC["om_client.py\nasync HTTP wrapper"]
-        CLS["classifier.py\nLLM PII classifier"]
+        OMC["om_client.py\nshared HTTP pool, TTL cache, retry/backoff"]
+        CFG["config.py\nTAG_MAP + REGULATION_TAGS loader"]
 
         subgraph Tools["tools/"]
             T1["search_sensitive.py"]
             T2["breach_impact.py\nBFS traversal"]
             T3["auto_classify.py\nLLM + tag write-back"]
             T4["compliance_report.py"]
-            T5["orphan_finder.py\nrisk scoring"]
+            T5["orphan_finder.py\nrisk scoring (parallel)"]
             T6["access_chain.py"]
+            T7["bulk_classify.py\nbatch PII tagging"]
+            T8["retention_checker.py\npolicy gap detection"]
+            T9["linkage_detector.py\nre-identification risk"]
+            T10["drift_monitor.py\ntag drift detection"]
+            T11["playbook_generator.py\nincident response"]
         end
 
         SRV --> Tools
         Tools --> OMC
-        T3 --> CLS
-        T4 --> CLS
+        T3 --> CFG
+        T4 --> CFG
+        T8 --> CFG
     end
 
     subgraph External["External APIs"]
         OM["OpenMetadata\nREST API"]
-        OAI["OpenAI API"]
+        GEM["Gemini API"]
     end
 
     C -->|MCP protocol| SRV
-    OMC -->|httpx async| OM
-    CLS -->|chat completions| OAI
+    OMC -->|httpx async\nshared pool| OM
+    T3 -->|chat completions| GEM
+    T4 -->|chat completions| GEM
+    T11 -->|chat completions| GEM
 ```
 
 ### Component Responsibilities
 
-**`server.py`** — FastMCP server entrypoint. Registers all six tools and holds the system prompt that shapes how the LLM agent uses them. Initializes the OpenMetadata client on startup.
+**`server.py`** — FastMCP server entrypoint. Registers all eleven tools and holds the system prompt that shapes how the LLM agent uses them. Initializes the OpenMetadata client on startup and registers an `atexit` handler to drain the connection pool on shutdown.
 
-**`om_client.py`** — Thin async HTTP wrapper around the OpenMetadata REST API. Provides `get`, `put`, and `patch` (JSON Patch / RFC 6902) methods. All tools use this exclusively — no direct HTTP calls in tool code.
+**`om_client.py`** — Async HTTP wrapper around the OpenMetadata REST API. Maintains a single shared `httpx.AsyncClient` connection pool for the lifetime of the process. Provides `get`, `put`, and `patch` (JSON Patch / RFC 6902) methods with TTL caching for lineage and team endpoints, and exponential backoff retry for transient errors (429, 502, 503, 504). All tools use this exclusively — no direct HTTP calls in tool code.
 
-**`classifier.py`** — Standalone LLM classifier. Sends column names + data types to OpenAI and returns structured PII category + confidence + tag FQN mappings. Used by `auto_classify`.
+**`config.py`** — Loads `TAG_MAP` and `REGULATION_TAGS` from env-specified JSON files, falling back to built-in defaults when the env var is unset, the file is absent, or the file contains invalid JSON. Used by `auto_classify`, `compliance_report`, and `retention_checker`.
 
 **`tools/`** — One file per tool. Each tool is a self-contained async function that composes `om_client` calls and optional LLM calls into a structured response.
 
@@ -155,16 +181,26 @@ dataguardian/
 ├── dataguardian/
 │   ├── __init__.py
 │   ├── server.py              # FastMCP server, tool registration
-│   ├── om_client.py           # Async OpenMetadata REST client
+│   ├── om_client.py           # Async OpenMetadata REST client (shared pool, cache, retry)
+│   ├── config.py              # Loads TAG_MAP and REGULATION_TAGS from env-specified JSON files
 │   └── tools/
 │       ├── __init__.py
 │       ├── search_sensitive.py    # Tag-based asset search
 │       ├── breach_impact.py       # BFS lineage traversal
 │       ├── auto_classify.py       # LLM PII classification + tag write-back
 │       ├── compliance_report.py   # Regulation-scoped compliance inventory
-│       ├── orphan_finder.py       # Risk scoring for ungoverned assets
-│       └── access_chain.py        # Ownership + notification chain builder
-├── classifier.py              # Standalone LLM PII classifier module
+│       ├── orphan_finder.py       # Risk scoring for ungoverned assets (parallel)
+│       ├── access_chain.py        # Ownership + notification chain builder
+│       ├── bulk_classify.py       # Batch PII tagging for unclassified tables
+│       ├── retention_checker.py   # Retention policy gap detection
+│       ├── linkage_detector.py    # Cross-table re-identification risk
+│       ├── drift_monitor.py       # Sensitive tag drift detection
+│       └── playbook_generator.py  # Incident response playbook generation
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py
+│   ├── unit/                  # Unit tests for each module
+│   └── property/              # Hypothesis property-based tests
 ├── pyproject.toml             # Package definition and dependencies
 ├── requirements.txt           # Pip-installable dependencies
 ├── mcp.json                   # MCP client configuration template
@@ -177,7 +213,7 @@ dataguardian/
 |---------|---------|
 | `fastmcp>=2.0.0` | MCP server framework |
 | `httpx>=0.27.0` | Async HTTP client for OpenMetadata API |
-| `openai>=1.30.0` | LLM calls for classification and report generation |
+| `google-generativeai` | Gemini LLM calls for classification and report generation |
 | `python-dotenv>=1.0.0` | Environment variable loading |
 | `pydantic>=2.0.0` | Data validation |
 | `rich>=13.0.0` | Terminal output formatting |
@@ -236,7 +272,7 @@ sequenceDiagram
     participant Agent as MCP Agent
     participant Tool as auto_classify.py
     participant OM as OpenMetadata API
-    participant LLM as OpenAI API
+    participant LLM as Gemini API
 
     Agent->>Tool: classify_table(table_fqn, dry_run)
     Tool->>OM: GET /tables/name/{fqn}?fields=columns,id
@@ -254,7 +290,7 @@ sequenceDiagram
 ```
 
 1. Fetches the full table schema from OpenMetadata (`/tables/name/{fqn}`)
-2. Builds a column summary (name + data type + description) and sends it to OpenAI
+2. Builds a column summary (name + data type + description) and sends it to Gemini
 3. Parses the structured JSON response mapping columns to PII categories
 4. Constructs JSON Patch operations (`add` to `/columns/{idx}/tags/-`) for each detected column
 5. Applies the patch to OpenMetadata via `PATCH /tables/{id}` (skipped in `dry_run` mode)
@@ -277,7 +313,7 @@ Tag FQN mapping (configurable in `TAG_MAP`):
 
 ### `compliance_report` — Regulation-Scoped Inventory
 
-Maps each regulation to a set of relevant tags, then fans out `search_sensitive` calls to collect all matching assets. Deduplicates by FQN, optionally filters by OpenMetadata domain, identifies orphaned assets (no owner), and passes the inventory to OpenAI to generate a structured markdown report.
+Maps each regulation to a set of relevant tags, then fans out `search_sensitive` calls to collect all matching assets. Deduplicates by FQN, optionally filters by OpenMetadata domain, identifies orphaned assets (no owner), and passes the inventory to Gemini to generate a structured markdown report.
 
 ```mermaid
 flowchart TD
@@ -288,7 +324,7 @@ flowchart TD
     DOMAIN{"domain\nfilter?"}
     FILTER["Filter to domain assets\nGET /search/query?q=domain.name:X"]
     ORPHAN["Identify orphaned assets\n(no owner field)"]
-    LLM["Send top-50 assets to OpenAI\nGenerate markdown report"]
+    LLM["Send top-50 assets to Gemini\nGenerate markdown report"]
     RESULT(["Return {inventory, report,\norphaned_count}"])
 
     START --> TAGS --> FAN --> DEDUP
@@ -375,6 +411,26 @@ flowchart TD
     NOTIFY --> RESULT
 ```
 
+### `bulk_classify` — Batch PII Tagging
+
+Searches for all sensitive assets, filters to tables that have no existing PII or PHI column-level tags, then runs `classify_table` on each one. Errors on individual tables are captured and do not abort the batch. Returns a summary with per-table results.
+
+### `retention_checker` — Retention Policy Gap Detection
+
+Searches for sensitive assets relevant to the specified regulation, then inspects each asset's description and custom properties for retention-related keywords (`retention`, `expiry`, `expire`, `purge`, `delete_after`, `ttl`). Assets with no matching keywords are classified as `NON_COMPLIANT` and returned with a recommended remediation action.
+
+### `linkage_detector` — Cross-Table Re-Identification Risk
+
+Retrieves all sensitive tables and their PII-tagged column names, then computes pairwise intersections of PII column name patterns. Pairs sharing two or more PII columns are flagged as `MEDIUM` risk; pairs sharing three or more are flagged as `HIGH` risk. Results are sorted by risk level descending.
+
+### `drift_monitor` — Sensitive Tag Drift Detection
+
+On first run, creates a baseline JSON snapshot of a table's column tags at `snapshot_path`. On subsequent runs, compares current tags against the snapshot and reports columns that lost sensitive tags (`DRIFT_DETECTED`) or are unchanged (`NO_DRIFT`). If the snapshot file contains invalid JSON, returns an error without overwriting the file.
+
+### `incident_playbook` — Incident Response Playbook Generation
+
+Combines `breach_impact` (full downstream blast radius) and `data_access_chain` (notification list) with regulation-specific obligations, then uses the LLM to generate a ready-to-send incident notification draft. Short-circuits without calling the LLM if either dependency returns an error.
+
 ---
 
 ## 7. Architecture Decisions
@@ -385,7 +441,7 @@ flowchart TD
 
 **Async throughout** — Every tool and HTTP call is `async`. This matters for `compliance_report` and `orphaned_sensitive_assets` which fan out multiple concurrent API calls. Using `httpx.AsyncClient` with a 30-second timeout keeps things responsive without blocking.
 
-**LLM only where necessary** — OpenAI is only called in `classify_table` and `compliance_report`. Everything else is deterministic API orchestration. This keeps costs low and latency predictable for the four non-LLM tools.
+**LLM only where necessary** — Gemini is only called in `classify_table`, `compliance_report`, `bulk_classify` (which delegates to `classify_table`), and `incident_playbook`. Everything else is deterministic API orchestration. This keeps costs low and latency predictable for the non-LLM tools.
 
 **BFS with visited set for lineage** — Lineage graphs can have cycles (e.g. a pipeline that reads and writes to the same domain). The visited set in `breach_impact` prevents infinite loops and redundant API calls.
 
@@ -397,11 +453,14 @@ flowchart TD
 
 ## 8. Performance Optimizations
 
+- **Shared HTTP connection pool** — `om_client` maintains a single `httpx.AsyncClient` for the lifetime of the process, configured with `max_connections=20` and `max_keepalive_connections=10`. This eliminates per-call TCP handshake overhead for high-frequency tools like `orphan_finder` and `compliance_report`.
+- **TTL cache for stable data** — Lineage graph responses (`/lineage/`) and team membership lookups (`/teams/name/`) are cached in memory with a configurable TTL (default 300 seconds via `CACHE_TTL_SECONDS`). Repeated queries within a session hit the cache instead of the API.
+- **Retry with exponential backoff** — Transient errors (429, 502, 503, 504) are retried up to `OM_MAX_RETRIES` times (default 3) with delay `base_delay * 2^attempt`. Non-retryable errors (400, 401, 403, 404) raise immediately.
+- **Parallel fan-out in `orphan_finder`** — Quality and lineage checks for each asset run concurrently via `asyncio.gather`. Individual check failures are caught and default to `False` without aborting the batch.
 - **Deduplication by FQN** — `compliance_report` and `orphan_finder` both fan out multiple tag searches that can return overlapping assets. FQN-based deduplication ensures each asset is processed once.
 - **Lineage depth cap** — `LINEAGE_MAX_DEPTH` (default 5, configurable via env) prevents runaway traversal on deeply connected graphs.
-- **Asset cap on LLM calls** — `compliance_report` caps the asset list at 50 items before sending to OpenAI to stay within token limits while still covering the most important assets.
+- **Asset cap on LLM calls** — `compliance_report` caps the asset list at 50 items before sending to Gemini to stay within token limits. The response includes `truncated` and `truncated_at` fields so callers know when a cap was applied.
 - **Entity type resolution short-circuit** — `breach_impact` tries entity types in order of likelihood (tables first) and stops at the first successful lookup.
-- **Per-request `httpx.AsyncClient`** — Each API call creates and closes its own client. This avoids connection pool state issues in long-running MCP server processes at the cost of connection reuse. A shared client with connection pooling would be a straightforward improvement.
 
 ---
 
@@ -411,7 +470,7 @@ flowchart TD
 
 - Python 3.11+
 - A running OpenMetadata instance (local or cloud)
-- Gemini API key (required for `classify_table` and `compliance_report`) — get one free at [aistudio.google.com](https://aistudio.google.com)
+- Gemini API key (required for `classify_table`, `bulk_classify`, `compliance_report`, and `incident_playbook`) — get one free at [aistudio.google.com](https://aistudio.google.com)
 
 ### 1. Install
 
@@ -439,15 +498,27 @@ Edit `.env`:
 OPENMETADATA_HOST=http://localhost:8585
 OPENMETADATA_JWT_TOKEN=your-jwt-token-here
 
-# LLM for auto-classification and compliance reports
-OPENAI_API_KEY=your-openai-key-here
-OPENAI_MODEL=gpt-4o-mini
+# LLM for auto-classification and compliance reports (Gemini)
+GEMINI_API_KEY=your-gemini-api-key-here
+GEMINI_MODEL=gemini-2.0-flash
 
 # Optional: max lineage traversal depth (default: 5)
 LINEAGE_MAX_DEPTH=5
+
+# Optional: HTTP connection pool — cache TTL and retry settings
+CACHE_TTL_SECONDS=300
+OM_MAX_RETRIES=3
+OM_RETRY_BASE_DELAY_SECONDS=0.5
+
+# Optional: custom tag/regulation mappings (JSON file paths)
+# If unset, built-in defaults are used.
+# DATAGUARDIAN_TAG_MAP_PATH=/path/to/tag_map.json
+# DATAGUARDIAN_REGULATION_TAGS_PATH=/path/to/regulation_tags.json
 ```
 
 To get your OpenMetadata JWT token: Settings → Bots → Ingestion Bot → copy the token.
+
+To get a Gemini API key: visit [aistudio.google.com](https://aistudio.google.com) — free tier available.
 
 ### 3. Run the MCP server
 
@@ -484,6 +555,11 @@ graph LR
         CR["compliance_report"]
         OS["orphaned_sensitive_assets"]
         AC["data_access_chain"]
+        BC["bulk_classify"]
+        RC["retention_checker"]
+        LD["linkage_detector"]
+        DM["drift_monitor"]
+        IP["incident_playbook"]
     end
 
     subgraph OM_APIs["OpenMetadata REST API"]
@@ -497,7 +573,7 @@ graph LR
         DOMAINS["/domains"]
     end
 
-    subgraph LLM_API["OpenAI API"]
+    subgraph LLM_API["Gemini API"]
         CHAT["chat.completions"]
     end
 
@@ -517,6 +593,19 @@ graph LR
     AC --> LINEAGE
     AC --> USERS
     AC --> TEAMS
+    BC --> SEARCH
+    BC --> TABLES_GET
+    BC --> CHAT
+    RC --> SEARCH
+    RC --> TABLES_GET
+    LD --> SEARCH
+    LD --> TABLES_GET
+    DM --> TABLES_GET
+    IP --> LINEAGE
+    IP --> TABLES_GET
+    IP --> USERS
+    IP --> TEAMS
+    IP --> CHAT
 ```
 
 ### `search_sensitive`
@@ -599,6 +688,72 @@ Returns: `{ table, direct_owner, owner_details, followers, domain, downstream_ow
 
 ---
 
+### `bulk_classify`
+
+Auto-classify all sensitive tables that have no existing PII/PHI column tags.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `dry_run` | `bool` | `False` | Preview tags without writing to OpenMetadata |
+| `limit` | `int` | `100` | Maximum number of unclassified tables to process |
+
+Returns: `{ dry_run, total_tables_scanned, total_unclassified, total_classified, total_sensitive_columns_found, errors, per_table }`
+
+---
+
+### `retention_checker`
+
+Find sensitive assets that have no retention policy or expiry metadata.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `regulation` | `str` | `"GDPR"` | GDPR, HIPAA, CCPA, or SOC2 |
+| `domain` | `str \| None` | `None` | Scope scan to an OpenMetadata domain |
+
+Returns: `{ regulation, total_scanned, non_compliant_count, non_compliant_assets, message }`
+
+---
+
+### `linkage_detector`
+
+Detect pairs of tables that could re-identify individuals when joined.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `domain` | `str \| None` | `None` | Scope analysis to an OpenMetadata domain |
+| `min_shared_columns` | `int` | `2` | Minimum shared PII columns to flag a pair |
+
+Returns: `{ total_tables_analyzed, total_flagged_pairs, flagged_pairs, message }`
+
+---
+
+### `drift_monitor`
+
+Monitor a table for sensitive tag drift — detect removed or added column tags.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `table_fqn` | `str` | required | Fully qualified name of the table to monitor |
+| `snapshot_path` | `str` | required | File path to save/load the tag snapshot (JSON) |
+
+Returns: `{ table_fqn, snapshot_timestamp, drift_status, lost_tags, gained_tags, error }`
+
+---
+
+### `incident_playbook`
+
+Generate a complete incident response playbook for a breached data asset.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `table_fqn` | `str` | required | Fully qualified name of the breached asset |
+| `regulation` | `str` | `"GDPR"` | GDPR, HIPAA, CCPA, or SOC2 |
+| `incident_description` | `str \| None` | `None` | Optional context about the incident for the LLM |
+
+Returns: `{ breached_asset, regulation, total_affected_assets, notification_list, playbook, error }`
+
+---
+
 ### OpenMetadata APIs Used
 
 | Endpoint | Used by |
@@ -618,28 +773,24 @@ Returns: `{ table, direct_owner, owner_details, followers, domain, downstream_ow
 
 - **OpenMetadata version compatibility** — Tested against OpenMetadata 1.x REST API. Lineage and tag endpoints may differ on older versions.
 - **LLM accuracy on classify_table** — PII detection quality depends on column names and descriptions. Columns with cryptic names (e.g. `col_a`, `field_23`) and no descriptions will have lower confidence. Always review `dry_run` output before enabling automated tagging.
-- **Token limits on compliance_report** — The asset list is capped at 50 items before being sent to OpenAI. Large catalogs with hundreds of sensitive assets will produce reports based on a sample.
-- **Per-request HTTP clients** — `om_client` creates a new `httpx.AsyncClient` per call. This works fine for typical MCP usage but is not optimal for high-frequency batch operations.
+- **Token limits on compliance_report** — The asset list is capped at 50 items before being sent to Gemini. Large catalogs with hundreds of sensitive assets will produce reports based on a sample. The response includes `truncated` and `truncated_at` fields to make this visible.
 - **No authentication beyond JWT** — Only Bearer token auth is supported. OAuth, mTLS, or API key auth would require changes to `om_client.py`.
 - **Lineage graph cycles** — The BFS visited set prevents infinite loops, but very large or densely connected lineage graphs may hit the depth cap before full traversal.
 - **Single OpenMetadata instance** — The client is initialized once at startup from environment variables. Multi-tenant or multi-instance setups are not supported.
+- **Drift monitor snapshot is local** — The tag snapshot is stored as a local JSON file. In distributed or containerized deployments, the snapshot path must be on a shared or persistent volume.
 
 ---
 
 ## 12. What I'd Improve With More Time
 
-- **Shared HTTP connection pool** — Replace per-request `httpx.AsyncClient` instances with a single shared client using connection pooling. This would meaningfully reduce latency for tools like `orphan_finder` that make many sequential API calls.
-
 - **Streaming compliance reports** — Large compliance reports currently block until the full LLM response is ready. Streaming the response back through the MCP tool would improve perceived responsiveness.
 
-- **Configurable tag taxonomy** — `TAG_MAP` in `auto_classify.py` and `REGULATION_TAGS` in `compliance_report.py` are hardcoded. Externalizing these to a config file or OpenMetadata custom properties would make DataGuardian adaptable to any organization's tag structure without code changes.
+- **Caching for lineage and ownership** — Lineage graphs and team memberships are cached with a TTL, but the cache is in-process and lost on restart. A distributed cache (e.g. Redis) would persist across restarts and share state across multiple server instances.
 
-- **Retry and circuit breaker on `om_client`** — Currently any API failure raises immediately. Adding exponential backoff retries and a circuit breaker would make the server more resilient to transient OpenMetadata outages.
-
-- **Parallel fan-out in `orphan_finder`** — Quality and lineage checks for each asset are currently sequential. Running them concurrently with `asyncio.gather` would dramatically reduce scan time for large catalogs.
-
-- **Caching for lineage and ownership** — Lineage graphs and team memberships change infrequently. A short TTL cache (e.g. 5 minutes) on these calls would reduce API load significantly during repeated queries.
-
-- **Test suite** — Unit tests for the BFS traversal logic, risk scoring, and tag patch construction. Integration tests against a local OpenMetadata sandbox.
+- **Test suite coverage for new tools** — Unit tests and property-based tests for `bulk_classify`, `retention_checker`, `linkage_detector`, `drift_monitor`, and `playbook_generator` would increase confidence in edge-case behavior.
 
 - **Support for more entity types in breach_impact** — Currently resolves FQNs as tables, dashboards, pipelines, topics, and ML models. Stored procedures and data products are not yet handled.
+
+- **Drift monitor remote snapshot storage** — The tag snapshot is stored as a local JSON file. Supporting remote storage (S3, GCS, or OpenMetadata custom properties) would make drift monitoring viable in containerized deployments.
+
+- **OAuth / mTLS support in om_client** — Only Bearer token auth is currently supported. Adding OAuth 2.0 or mTLS would enable DataGuardian to work with OpenMetadata instances that enforce stronger authentication.

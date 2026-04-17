@@ -4,10 +4,9 @@ Aggregates data from Tags, Lineage, Governance, and Teams APIs to produce
 a structured compliance inventory (GDPR Article 30, HIPAA, CCPA).
 """
 
-import os
 import json
-import openai
 from dataguardian import om_client
+from dataguardian.llm_client import get_client, get_model
 from dataguardian.tools.search_sensitive import search_sensitive_assets
 
 REGULATION_TAGS = {
@@ -83,9 +82,9 @@ async def generate_compliance_report(
     orphaned = [a for a in unique_assets if not a.get("owner")]
 
     # 4. Generate narrative report via LLM
-    client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = get_client()
     response = await client.chat.completions.create(
-        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        model=get_model(),
         messages=[{
             "role": "user",
             "content": REPORT_PROMPT.format(

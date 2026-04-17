@@ -6,9 +6,8 @@ This is the closed-loop governance feature — discovery to tagging in one shot.
 """
 
 import json
-import os
-import openai
 from dataguardian import om_client
+from dataguardian.llm_client import get_client, get_model
 
 # Mapping of LLM-detected categories to OpenMetadata tag FQNs
 # Adjust these to match your OpenMetadata classification setup
@@ -77,9 +76,9 @@ async def auto_classify_table(
     )
 
     # 3. Ask LLM to classify
-    client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = get_client()
     response = await client.chat.completions.create(
-        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        model=get_model(),
         messages=[{
             "role": "user",
             "content": CLASSIFICATION_PROMPT.format(

@@ -1,0 +1,20 @@
+[project]
+name = "dataguardian"
+version = "0.1.0"
+description = "AI-powered Compliance & Breach Impact Agent for OpenMetadata"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.27.0",
+    "openai>=1.30.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+dataguardian = "dataguardian.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

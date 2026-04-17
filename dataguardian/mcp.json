@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "dataguardian": {
+      "command": "python",
+      "args": ["-m", "dataguardian.server"],
+      "cwd": "${workspaceFolder}/dataguardian",
+      "env": {
+        "OPENMETADATA_HOST": "http://localhost:8585",
+        "OPENMETADATA_JWT_TOKEN": "your-jwt-token-here",
+        "OPENAI_API_KEY": "your-openai-key-here",
+        "OPENAI_MODEL": "gpt-4o-mini",
+        "LINEAGE_MAX_DEPTH": "5"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "search_sensitive",
+        "breach_impact",
+        "orphaned_sensitive_assets",
+        "data_access_chain",
+        "compliance_report"
+      ]
+    }
+  }
+}

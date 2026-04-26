@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
 # Install system dependencies
@@ -14,17 +13,15 @@ COPY pyproject.toml requirements.txt ./
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the source
+# Copy source
 COPY . .
 
-# Install the package itself
+# Install the package
 RUN pip install --no-cache-dir -e .
 
-# Force HTTP transport when running in Docker/Railway
+# Railway injects $PORT at runtime — default to 8000 for local Docker runs
+ENV PORT=8000
 ENV MCP_TRANSPORT=http
 
-# Expose default port (Railway overrides this with $PORT at runtime)
-EXPOSE 8000
-
-# Start the MCP server
-CMD ["python", "-m", "dataguardian.server"]
+# Use uvicorn to serve the ASGI app — host 0.0.0.0 is required for Railway routing
+CMD uvicorn dataguardian.server:app --host 0.0.0.0 --port $PORT

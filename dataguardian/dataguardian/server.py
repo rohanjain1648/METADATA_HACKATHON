@@ -2,10 +2,12 @@
 DataGuardian MCP Server
 AI-powered Compliance & Breach Impact Agent for OpenMetadata
 
-Run with:
-    fastmcp run dataguardian/server.py
-Or install and run:
+Local (stdio):
     dataguardian
+    python -m dataguardian.server
+
+Railway / cloud (HTTP via uvicorn):
+    uvicorn dataguardian.server:app --host 0.0.0.0 --port $PORT
 """
 
 import atexit
@@ -14,11 +16,13 @@ import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, JSONResponse
 
 load_dotenv()
 
-# Import om_client — init() is called in main() after env vars are confirmed present
+# ---------------------------------------------------------------------------
+# OpenMetadata client — lazy init so missing env vars don't crash at import
+# ---------------------------------------------------------------------------
 from dataguardian import om_client
 
 from dataguardian.tools.search_sensitive import search_sensitive_assets
@@ -71,6 +75,10 @@ Always be specific, cite asset FQNs, and prioritize actionable recommendations.
 )
 
 
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def search_sensitive(
     tag: str = "PII",
@@ -79,9 +87,6 @@ async def search_sensitive(
 ) -> dict:
     """
     Search OpenMetadata for data assets tagged with a sensitivity label.
-
-    Use this to find all tables, dashboards, pipelines, or topics that contain
-    PII, GDPR, HIPAA, PHI, Confidential, or other sensitive data.
 
     Args:
         tag: Sensitivity tag to search for. Common values: PII, GDPR, HIPAA, PHI, Sensitive, Confidential.
@@ -98,10 +103,7 @@ async def breach_impact(
     depth: int = 5,
 ) -> dict:
     """
-    Given a table or asset FQN, traverse the lineage graph to find everything affected.
-
-    Use this when a data asset may be compromised — it returns the full blast radius:
-    every downstream table, dashboard, pipeline, ML model, and their owners.
+    Traverse the lineage graph from a given asset to find the full blast radius.
 
     Args:
         fqn: Fully qualified name of the asset (e.g. mysql_prod.analytics.public.users).
@@ -117,10 +119,7 @@ async def classify_table(
     dry_run: bool = False,
 ) -> dict:
     """
-    Auto-classify a table's columns for PII and sensitive data using AI, then tag in OpenMetadata.
-
-    This is the closed-loop governance tool: it reads the schema, uses an LLM to detect
-    sensitive columns (email, SSN, phone, DOB, etc.), and writes tags back to OpenMetadata.
+    Auto-classify a table's columns for PII using AI, then tag in OpenMetadata.
 
     Args:
         table_fqn: Fully qualified name of the table to classify.
@@ -137,9 +136,6 @@ async def compliance_report(
 ) -> dict:
     """
     Generate a compliance inventory report for GDPR, HIPAA, CCPA, or SOC2.
-
-    Aggregates all sensitive assets from OpenMetadata, identifies owners,
-    flags ungoverned assets, and produces a structured compliance document.
 
     Args:
         regulation: GDPR | HIPAA | CCPA | SOC2
@@ -161,9 +157,6 @@ async def orphaned_sensitive_assets(
     """
     Find sensitive/PII assets with no owner, no data quality tests, or no lineage.
 
-    These are the highest-risk assets in your organization — sensitive data that
-    nobody is responsible for and nobody is monitoring.
-
     Args:
         check_quality: Also flag assets with no data quality test suites.
         check_lineage: Also flag assets with no lineage connections.
@@ -177,10 +170,7 @@ async def orphaned_sensitive_assets(
 @mcp.tool()
 async def data_access_chain(table_fqn: str) -> dict:
     """
-    Get the complete access chain for a sensitive table.
-
-    Returns direct owners, team memberships, followers, downstream asset owners,
-    and a ready-to-use notification list for incident response.
+    Get the complete ownership and access chain for a sensitive table.
 
     Args:
         table_fqn: Fully qualified name of the table.
@@ -195,10 +185,6 @@ async def bulk_classify(
 ) -> dict:
     """
     Auto-classify all sensitive tables that have no existing PII/PHI column tags.
-
-    Searches for sensitive assets, filters to unclassified tables, then runs
-    classify_table on each one. Use this to bootstrap PII tagging for a new
-    OpenMetadata instance without invoking classify_table individually.
 
     Args:
         dry_run: If True, shows what would be tagged without writing to OpenMetadata.
@@ -215,9 +201,6 @@ async def retention_checker(
     """
     Find sensitive assets that have no retention policy or expiry metadata.
 
-    Checks each asset's description and custom properties for retention-related
-    keywords. Non-compliant assets are flagged with a recommended remediation action.
-
     Args:
         regulation: GDPR | HIPAA | CCPA | SOC2 (default GDPR).
         domain: Optional OpenMetadata domain name to scope the scan.
@@ -233,9 +216,6 @@ async def linkage_detector(
     """
     Detect pairs of tables that could re-identify individuals when joined.
 
-    Identifies tables sharing two or more PII column name patterns (email, ssn,
-    user_id, etc.). HIGH risk = 3+ shared columns, MEDIUM = 2 shared columns.
-
     Args:
         domain: Optional OpenMetadata domain name to scope the analysis.
         min_shared_columns: Minimum shared PII columns to flag a pair (default 2).
@@ -250,9 +230,6 @@ async def drift_monitor(
 ) -> dict:
     """
     Monitor a table for sensitive tag drift — detect removed or added column tags.
-
-    On first run, creates a baseline snapshot. On subsequent runs, compares current
-    tags against the snapshot and reports any columns that lost sensitive tags.
 
     Args:
         table_fqn: Fully qualified name of the table to monitor.
@@ -270,9 +247,6 @@ async def incident_playbook(
     """
     Generate a complete incident response playbook for a breached data asset.
 
-    Combines breach impact analysis, access chain resolution, and regulation-specific
-    obligations to produce a ready-to-send notification draft.
-
     Args:
         table_fqn: Fully qualified name of the breached asset.
         regulation: GDPR | HIPAA | CCPA | SOC2 (default GDPR).
@@ -285,32 +259,54 @@ async def incident_playbook(
     )
 
 
-@mcp.custom_route("/health", methods=["GET"])
-async def health_check(request: Request) -> PlainTextResponse:
-    """Lightweight health check endpoint for Railway."""
-    return PlainTextResponse("OK")
+# ---------------------------------------------------------------------------
+# Health check endpoint (used by Railway)
+# ---------------------------------------------------------------------------
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "DataGuardian"})
+
+
+# ---------------------------------------------------------------------------
+# ASGI app — used by uvicorn for Railway deployment
+# Uvicorn imports this module and calls `app` directly.
+# om_client.init() runs inside the lifespan so env var errors surface in logs.
+# ---------------------------------------------------------------------------
+
+def _build_app():
+    """Build the ASGI app, initializing om_client if env vars are present."""
+    # Only init if the required vars exist (allows import without crashing)
+    if os.environ.get("OPENMETADATA_HOST") and os.environ.get("OPENMETADATA_JWT_TOKEN"):
+        om_client.init()
+    return mcp.http_app()
+
+
+app = _build_app()
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint — used locally (stdio) or can also launch uvicorn directly
+# ---------------------------------------------------------------------------
 
 def main():
-    # Validate required env vars before starting — gives a clear error in Railway logs
-    missing = [v for v in ("OPENMETADATA_HOST", "OPENMETADATA_JWT_TOKEN", "GEMINI_API_KEY")
-               if not os.environ.get(v)]
-    if missing:
-        print(f"ERROR: Missing required environment variables: {', '.join(missing)}", flush=True)
-        print("Set these in Railway → your service → Variables tab.", flush=True)
-        raise SystemExit(1)
-
-    # Initialize the shared OpenMetadata HTTP client
-    om_client.init()
-
-    # Use HTTP transport if MCP_TRANSPORT=http OR if PORT is set (Railway always sets PORT)
     port_env = os.environ.get("PORT")
     transport = os.environ.get("MCP_TRANSPORT", "http" if port_env else "stdio")
     port = int(port_env or 8000)
 
+    # Validate required env vars
+    missing = [v for v in ("OPENMETADATA_HOST", "OPENMETADATA_JWT_TOKEN", "GEMINI_API_KEY")
+               if not os.environ.get(v)]
+    if missing:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing)}", flush=True)
+        raise SystemExit(1)
+
+    om_client.init()
+
     if transport == "http":
+        import uvicorn
         print(f"Starting DataGuardian MCP server (HTTP) on 0.0.0.0:{port}", flush=True)
-        mcp.run(transport="http", host="0.0.0.0", port=port)
+        uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         mcp.run()
 

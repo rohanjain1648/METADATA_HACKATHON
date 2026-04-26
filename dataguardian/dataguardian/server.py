@@ -18,9 +18,8 @@ from starlette.responses import PlainTextResponse
 
 load_dotenv()
 
-# Initialize OpenMetadata client before importing tools
+# Import om_client — init() is called in main() after env vars are confirmed present
 from dataguardian import om_client
-om_client.init()
 
 from dataguardian.tools.search_sensitive import search_sensitive_assets
 from dataguardian.tools.breach_impact import get_breach_impact_graph
@@ -293,18 +292,26 @@ async def health_check(request: Request) -> PlainTextResponse:
 
 
 def main():
+    # Validate required env vars before starting — gives a clear error in Railway logs
+    missing = [v for v in ("OPENMETADATA_HOST", "OPENMETADATA_JWT_TOKEN", "GEMINI_API_KEY")
+               if not os.environ.get(v)]
+    if missing:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing)}", flush=True)
+        print("Set these in Railway → your service → Variables tab.", flush=True)
+        raise SystemExit(1)
+
+    # Initialize the shared OpenMetadata HTTP client
+    om_client.init()
+
     # Use HTTP transport if MCP_TRANSPORT=http OR if PORT is set (Railway always sets PORT)
     port_env = os.environ.get("PORT")
     transport = os.environ.get("MCP_TRANSPORT", "http" if port_env else "stdio")
     port = int(port_env or 8000)
 
     if transport == "http":
-        # HTTP transport — used when deployed on Railway / cloud
-        # host="0.0.0.0" is required so Railway can route external traffic in
         print(f"Starting DataGuardian MCP server (HTTP) on 0.0.0.0:{port}", flush=True)
         mcp.run(transport="http", host="0.0.0.0", port=port)
     else:
-        # stdio transport — used locally with Claude Desktop / Kiro
         mcp.run()
 
 

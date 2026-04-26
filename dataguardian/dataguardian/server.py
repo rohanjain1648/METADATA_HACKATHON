@@ -293,15 +293,18 @@ async def health_check(request: Request) -> PlainTextResponse:
 
 
 def main():
-    transport = os.environ.get("MCP_TRANSPORT", "stdio")
-    port = int(os.environ.get("PORT", 8000))
+    # Use HTTP transport if MCP_TRANSPORT=http OR if PORT is set (Railway always sets PORT)
+    port_env = os.environ.get("PORT")
+    transport = os.environ.get("MCP_TRANSPORT", "http" if port_env else "stdio")
+    port = int(port_env or 8000)
 
     if transport == "http":
         # HTTP transport — used when deployed on Railway / cloud
         # host="0.0.0.0" is required so Railway can route external traffic in
+        print(f"Starting DataGuardian MCP server (HTTP) on 0.0.0.0:{port}", flush=True)
         mcp.run(transport="http", host="0.0.0.0", port=port)
     else:
-        # Default stdio transport — used locally with Claude Desktop / Kiro
+        # stdio transport — used locally with Claude Desktop / Kiro
         mcp.run()
 
 

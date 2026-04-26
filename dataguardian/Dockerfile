@@ -20,9 +20,11 @@ COPY . .
 # Install the package itself
 RUN pip install --no-cache-dir -e .
 
-# Expose the port Railway will assign via $PORT
+# Force HTTP transport when running in Docker/Railway
+ENV MCP_TRANSPORT=http
+
+# Expose default port (Railway overrides this with $PORT at runtime)
 EXPOSE 8000
 
-# Run the MCP server in streamable-HTTP mode
-# FastMCP reads PORT from the environment automatically
+# Start the MCP server
 CMD ["python", "-m", "dataguardian.server"]

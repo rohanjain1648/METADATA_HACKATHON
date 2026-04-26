@@ -13,6 +13,8 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
 load_dotenv()
 
@@ -284,8 +286,23 @@ async def incident_playbook(
     )
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> PlainTextResponse:
+    """Lightweight health check endpoint for Railway."""
+    return PlainTextResponse("OK")
+
+
 def main():
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    port = int(os.environ.get("PORT", 8000))
+
+    if transport == "http":
+        # HTTP transport — used when deployed on Railway / cloud
+        # host="0.0.0.0" is required so Railway can route external traffic in
+        mcp.run(transport="http", host="0.0.0.0", port=port)
+    else:
+        # Default stdio transport — used locally with Claude Desktop / Kiro
+        mcp.run()
 
 
 if __name__ == "__main__":
